@@ -1,0 +1,309 @@
+--- a/src/video/uikit/SDL_uikitappdelegate.m
++++ b/src/video/uikit/SDL_uikitappdelegate.m
+@@ -89,7 +89,7 @@
+ /* Load a launch image using the old UILaunchImageFile-era naming rules. */
+ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
+ {
+-    UIInterfaceOrientation curorient = [UIApplication sharedApplication].statusBarOrientation;
++    UIInterfaceOrientation curorient = UIKit_GetSceneOrientation([UIScreen mainScreen]);
+     UIUserInterfaceIdiom idiom = [UIDevice currentDevice].userInterfaceIdiom;
+     UIImage *image = nil;
+ 
+@@ -146,8 +146,12 @@
+     self.storyboardViewController.view.frame = self.view.bounds;
+     [self.storyboardViewController didMoveToParentViewController:self];
+ 
+-    UIApplication.sharedApplication.statusBarHidden = self.prefersStatusBarHidden;
+-    UIApplication.sharedApplication.statusBarStyle = self.preferredStatusBarStyle;
++    if (![[NSBundle.mainBundle objectForInfoDictionaryKey:@"UIViewControllerBasedStatusBarAppearance"] boolValue]) {
++        UIApplication.sharedApplication.statusBarHidden = self.prefersStatusBarHidden;
++        UIApplication.sharedApplication.statusBarStyle = self.preferredStatusBarStyle;
++    } else {
++        [self setNeedsStatusBarAppearanceUpdate];
++    }
+ }
+ 
+ - (BOOL)prefersStatusBarHidden {
+@@ -219,7 +223,7 @@
+         int screenh = (int)([UIScreen mainScreen].bounds.size.height + 0.5);
+ 
+ #if !TARGET_OS_TV
+-        UIInterfaceOrientation curorient = [UIApplication sharedApplication].statusBarOrientation;
++        UIInterfaceOrientation curorient = UIKit_GetSceneOrientation([UIScreen mainScreen]);
+ 
+         /* We always want portrait-oriented size, to match UILaunchImageSize. */
+         if (screenw > screenh) {
+--- a/src/video/uikit/SDL_uikitmodes.m
++++ b/src/video/uikit/SDL_uikitmodes.m
+@@ -355,7 +355,7 @@
+ {
+ #if !TARGET_OS_TV
+     if (uiscreen == [UIScreen mainScreen]) {
+-        return UIInterfaceOrientationIsLandscape([UIApplication sharedApplication].statusBarOrientation);
++        return UIInterfaceOrientationIsLandscape(UIKit_GetSceneOrientation([UIScreen mainScreen]));
+     } else
+ #endif /* !TARGET_OS_TV */
+     {
+@@ -525,7 +525,7 @@
+ #if !TARGET_OS_TV
+ void SDL_OnApplicationDidChangeStatusBarOrientation(void)
+ {
+-    BOOL isLandscape = UIInterfaceOrientationIsLandscape([UIApplication sharedApplication].statusBarOrientation);
++    BOOL isLandscape = UIInterfaceOrientationIsLandscape(UIKit_GetSceneOrientation([UIScreen mainScreen]));
+     SDL_VideoDisplay *display = SDL_GetDisplay(0);
+ 
+     if (display) {
+@@ -550,7 +550,7 @@
+             currentmode->h = height;
+         }
+ 
+-        switch ([UIApplication sharedApplication].statusBarOrientation) {
++        switch (UIKit_GetSceneOrientation([UIScreen mainScreen])) {
+         case UIInterfaceOrientationPortrait:
+             orientation = SDL_ORIENTATION_PORTRAIT;
+             break;
+--- a/src/video/uikit/SDL_uikitvideo.h
++++ b/src/video/uikit/SDL_uikitvideo.h
+@@ -33,6 +33,10 @@
+ 
+ @end
+ 
++#if !TARGET_OS_TV
++UIInterfaceOrientation UIKit_GetSceneOrientation(UIScreen *screen);
++#endif
++
+ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen);
+ 
+ #endif /* __OBJC__ */
+--- a/src/video/uikit/SDL_uikitvideo.m
++++ b/src/video/uikit/SDL_uikitvideo.m
+@@ -194,6 +194,24 @@
+     return [[UIDevice currentDevice].systemVersion doubleValue] >= version;
+ }
+ 
++// PvZ local SDL2 adaptation: use the owning scene, never a process-wide orientation.
++#if !TARGET_OS_TV
++UIInterfaceOrientation UIKit_GetSceneOrientation(UIScreen *screen)
++{
++    UIWindowScene *fallback = nil;
++    for (UIScene *candidate in UIApplication.sharedApplication.connectedScenes) {
++        UIWindowScene *scene = (UIWindowScene *)candidate;
++        if (![candidate isKindOfClass:UIWindowScene.class]) continue;
++        if (scene.screen != screen) continue;
++        if (scene.activationState == UISceneActivationStateForegroundActive) {
++            return scene.effectiveGeometry.interfaceOrientation;
++        }
++        if (scene.activationState == UISceneActivationStateForegroundInactive || !fallback) fallback = scene;
++    }
++    return fallback ? fallback.effectiveGeometry.interfaceOrientation : UIInterfaceOrientationUnknown;
++}
++#endif
++
+ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen)
+ {
+     SDL_WindowData *data = (__bridge SDL_WindowData *) window->driverdata;
+@@ -220,7 +238,7 @@
+      * https://bugzilla.libsdl.org/show_bug.cgi?id=3505
+      * https://bugzilla.libsdl.org/show_bug.cgi?id=3465
+      * https://forums.developer.apple.com/thread/65337 */
+-    orient = [UIApplication sharedApplication].statusBarOrientation;
++    orient = data.uiwindow.windowScene ? data.uiwindow.windowScene.effectiveGeometry.interfaceOrientation : UIKit_GetSceneOrientation(screen);
+     landscape = UIInterfaceOrientationIsLandscape(orient) ||
+                     !(UIKit_GetSupportedOrientations(window) & (UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskPortraitUpsideDown));
+     fullscreen = CGRectEqualToRect(screen.bounds, frame);
+--- a/src/video/uikit/SDL_uikitviewcontroller.m
++++ b/src/video/uikit/SDL_uikitviewcontroller.m
+@@ -22,7 +22,10 @@
+ 
+ #ifdef SDL_VIDEO_DRIVER_UIKIT
+ 
++#include <math.h>
++#include <limits.h>
+ #include "SDL_video.h"
++#include "SDL_timer.h"
+ #include "SDL_hints.h"
+ #include "../SDL_sysvideo.h"
+ #include "../../events/SDL_events_c.h"
+@@ -74,6 +77,22 @@
+ 	return [super canPerformAction:action withSender:sender];
+ }
+ @end
++
++// Bounded keyboard-request probes; no text contents or private device data.
++static void PVZTraceKeyboardRequest(const char *phase, UITextField *field,
++                                   BOOL wasVisible, BOOL attempted, BOOL accepted)
++{
++    static unsigned int budget = 16;
++    UIWindow *host = field.window;
++    if (budget == 0) return;
++    --budget;
++    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                "PVZKeyboard[r5]: unix=%.3f tick=%u phase=%s was_visible=%d window=%d scene=%d scene_state=%ld key=%d first=%d attempted=%d accepted=%d",
++                NSDate.date.timeIntervalSince1970, SDL_GetTicks(), phase, wasVisible,
++                host != nil, host.windowScene != nil,
++                host.windowScene ? (long)host.windowScene.activationState : -1L,
++                host.isKeyWindow, field.isFirstResponder, attempted, accepted);
++}
+ 
+ @implementation SDL_uikitviewcontroller {
+     CADisplayLink *displayLink;
+@@ -409,28 +428,42 @@
+ /* reveal onscreen virtual keyboard */
+ - (void)showKeyboard
+ {
+-    if (keyboardVisible) {
++    BOOL wasVisible = keyboardVisible;
++    BOOL accepted;
++    if (keyboardVisible && textField.isFirstResponder) {
++        PVZTraceKeyboardRequest("already-focused", textField, wasVisible, NO, YES);
+         return;
+     }
+-
++    if (!textField.window) {
++        // A request before attachment must not block the next user retry.
++        keyboardVisible = NO;
++        showingKeyboard = NO;
++        PVZTraceKeyboardRequest("no-window", textField, wasVisible, NO, NO);
++        return;
++    }
+     keyboardVisible = YES;
+-    if (textField.window) {
+-        showingKeyboard = YES;
+-        [textField becomeFirstResponder];
+-    }
++    showingKeyboard = YES;
++    accepted = [textField becomeFirstResponder];
++    if (!accepted) {
++        keyboardVisible = NO;
++        showingKeyboard = NO;
++    }
++    PVZTraceKeyboardRequest("show-result", textField, wasVisible, YES, accepted);
+ }
+ 
+ /* hide onscreen virtual keyboard */
+ - (void)hideKeyboard
+ {
+-    if (!keyboardVisible) {
+-        return;
+-    }
+-
++    BOOL wasVisible = keyboardVisible;
++    BOOL accepted;
+     keyboardVisible = NO;
+-    if (textField.window) {
++    // resign can synchronously notify keyboardWillHide -> SDL_StopTextInput.
++    if (hidingKeyboard) return;
++    if (textField.window && textField.isFirstResponder) {
+         hidingKeyboard = YES;
+-        [textField resignFirstResponder];
++        accepted = [textField resignFirstResponder];
++        if (!accepted) hidingKeyboard = NO;
++        PVZTraceKeyboardRequest("hide-result", textField, wasVisible, YES, accepted);
+     }
+ }
+ 
+@@ -438,22 +471,48 @@
+ {
+     BOOL shouldStartTextInput = NO;
+ #if !TARGET_OS_TV
+-    CGRect kbrect;
++    CGRect kbrect, overlap;
++    UIWindow *host;
++    UIScreen *screen;
++    BOOL valid, active;
++    CGFloat height;
++    static unsigned int pvzKeyboardLogBudget = 16;
+ #endif
+ 
+     if (!SDL_IsTextInputActive() && !hidingKeyboard && !rotatingOrientation) {
+         shouldStartTextInput = YES;
+     }
+ 
+-    showingKeyboard = YES;
+ #if !TARGET_OS_TV
+     kbrect = [[notification userInfo][UIKeyboardFrameEndUserInfoKey] CGRectValue];
+ 
+-    /* The keyboard rect is in the coordinate space of the screen/window, but we
+-     * want its height in the coordinate space of the view. */
+-    kbrect = [self.view convertRect:kbrect fromView:nil];
+-
+-    [self setKeyboardHeight:(int)kbrect.size.height];
++    // PvZ local SDL2 fix: UIKit reports screen coordinates, not window coordinates.
++    // A zero-height keyboard during scene deactivation must not be transformed.
++    host = self.view.window;
++    screen = [notification.object isKindOfClass:UIScreen.class] ? notification.object : host.screen;
++    valid = isfinite(kbrect.origin.x) && isfinite(kbrect.origin.y) &&
++                       isfinite(kbrect.size.width) && isfinite(kbrect.size.height);
++    active = host.windowScene && host.windowScene.activationState == UISceneActivationStateForegroundActive;
++    if (pvzKeyboardLogBudget > 0) {
++        --pvzKeyboardLogBudget;
++        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PVZUIKit[r5]: unix=%.3f tick=%u keyboardWillShow active=%d same_screen=%d valid=%d rect=(%.1f,%.1f,%.1f,%.1f)",
++                    NSDate.date.timeIntervalSince1970, SDL_GetTicks(), active, screen == host.screen, valid,
++                    kbrect.origin.x, kbrect.origin.y, kbrect.size.width, kbrect.size.height);
++    }
++    if (!host || !screen || screen != host.screen) return;
++    if (!valid || CGRectIsEmpty(kbrect) || !active) {
++        showingKeyboard = NO;
++        [self setKeyboardHeight:0];
++        return;
++    } else {
++        showingKeyboard = YES;
++        kbrect = [screen.coordinateSpace convertRect:kbrect toCoordinateSpace:self.view];
++        overlap = CGRectIntersection(self.view.bounds, kbrect);
++        height = CGRectIsNull(overlap) || CGRectIsEmpty(overlap) ? 0 : overlap.size.height;
++        [self setKeyboardHeight:isfinite(height) && height <= INT_MAX ? (int)height : 0];
++    }
++#else
++    showingKeyboard = YES;
+ #endif
+ 
+     if (shouldStartTextInput) {
+--- a/src/video/uikit/SDL_uikitwindow.m
++++ b/src/video/uikit/SDL_uikitwindow.m
+@@ -196,7 +196,8 @@
+             }
+         }
+ 
+-        if (data.uiscreen == [UIScreen mainScreen]) {
++        if (data.uiscreen == [UIScreen mainScreen] &&
++            ![[NSBundle.mainBundle objectForInfoDictionaryKey:@"UIViewControllerBasedStatusBarAppearance"] boolValue]) {
+             if (window->flags & (SDL_WINDOW_FULLSCREEN|SDL_WINDOW_BORDERLESS)) {
+                 [UIApplication sharedApplication].statusBarHidden = YES;
+             } else {
+@@ -272,10 +273,12 @@
+ 
+ #if !TARGET_OS_TV
+     if (data.uiwindow.screen == [UIScreen mainScreen]) {
+-        if (window->flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS)) {
+-            [UIApplication sharedApplication].statusBarHidden = YES;
+-        } else {
+-            [UIApplication sharedApplication].statusBarHidden = NO;
++        if (![[NSBundle.mainBundle objectForInfoDictionaryKey:@"UIViewControllerBasedStatusBarAppearance"] boolValue]) {
++            if (window->flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS)) {
++                [UIApplication sharedApplication].statusBarHidden = YES;
++            } else {
++                [UIApplication sharedApplication].statusBarHidden = NO;
++            }
+         }
+ 
+         [viewcontroller setNeedsStatusBarAppearanceUpdate];
+--- a/src/video/SDL_video.c
++++ b/src/video/SDL_video.c
+@@ -4364,6 +4364,17 @@
+ void SDL_StartTextInput(void)
+ {
+     SDL_Window *window;
++#if defined(SDL_VIDEO_DRIVER_UIKIT)
++    static unsigned int pvzTextLogBudget = 16;
++    if (pvzTextLogBudget > 0) {
++        SDL_Window *focus = SDL_GetFocusWindow();
++        --pvzTextLogBudget;
++        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                    "PVZKeyboard[r5]: tick=%u phase=SDL_StartTextInput focus=%u text_active=%d screen_enabled=%d",
++                    SDL_GetTicks(), focus ? SDL_GetWindowID(focus) : 0,
++                    SDL_IsTextInputActive(), SDL_GetHintBoolean(SDL_HINT_ENABLE_SCREEN_KEYBOARD, SDL_TRUE));
++    }
++#endif
+ 
+     /* First, enable text events */
+     (void)SDL_EventState(SDL_TEXTINPUT, SDL_ENABLE);
