@@ -2,6 +2,8 @@
 
 经典初代《植物大战僵尸》PC 年度版（GOTY）的社区移植改进分支，面向 iPhone、iPad 和 Apple 芯片 Mac。项目以 [wszqkzqk 的 PvZ-Portable](https://github.com/wszqkzqk/PvZ-Portable) 为基础，继承了上游的三端支持、基础玩法、资源加载和跨平台关卡存档。这里主要改进触屏操作、游戏菜单和冒险重玩体验。
 
+**[下载中文游戏资源包](https://github.com/Matrixqlc/PvZ-Portable-Apple/releases/download/v0.1.0/PvZ-GOTY-zh-CN-resources.zip)** · [准备游戏数据](#准备游戏数据) · [构建与安装](#构建与安装)
+
 ## 这个分支的改动
 
 本分支由 Matrixqlc 在上游源码基础上修改。首个公开基线整理于 2026-11-07。
